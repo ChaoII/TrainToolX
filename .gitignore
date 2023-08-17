@@ -2,10 +2,12 @@
 __pycache__/
 *.py[cod]
 *$py.class
-
+insect_det
+insect_det.tar.gz
+output
 # C extensions
 *.so
-
+.idea
 # Distribution / packaging
 .Python
 build/
