@@ -113,8 +113,7 @@ class ATSSAssigner(nn.Layer):
             assigned_bboxes (Tensor): (B, L, 4)
             assigned_scores (Tensor): (B, L, C), if pred_bboxes is not None, then output ious
         """
-        assert gt_labels.ndim == gt_bboxes.ndim and \
-               gt_bboxes.ndim == 3
+        assert gt_labels.ndim == gt_bboxes.ndim and gt_bboxes.ndim == 3
 
         num_anchors, _ = anchor_bboxes.shape
         batch_size, num_max_boxes, _ = gt_bboxes.shape

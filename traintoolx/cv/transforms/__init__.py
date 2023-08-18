@@ -1,5 +1,5 @@
 from .operators import *
-from .batch_operators import BatchRandomResize, BatchRandomResizeByShort, _BatchPadding
+from .batch_operators import BatchRandomResize, BatchRandomResizeByShort, _BatchPadding, PadGT, PadRGT
 from traintoolx.cv import transforms as T
 
 

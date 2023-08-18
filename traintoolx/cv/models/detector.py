@@ -1,5 +1,3 @@
-from __future__ import absolute_import
-
 import collections
 import copy
 import os
@@ -13,7 +11,7 @@ import traintoolx
 import traintoolx.utils.logging as logging
 from traintoolx.cv.transforms.operators import _NormalizeBox, _PadBox, _BboxXYXY2XYWH, Resize, Padding
 from traintoolx.cv.transforms.batch_operators import BatchCompose, BatchRandomResize, BatchRandomResizeByShort, \
-    _BatchPadding, _Gt2YoloTarget
+    _BatchPadding, _Gt2YoloTarget, PadGT, PadRGT
 from traintoolx.cv.transforms import arrange_transforms
 from .base import BaseModel
 from .utils.det_metrics import VOCMetric, COCOMetric
@@ -22,7 +20,7 @@ from traintoolx.utils.checkpoint import det_pretrain_weights_dict
 
 __all__ = [
     "YOLOv3", "FasterRCNN", "PPYOLO", "PPYOLOTiny", "PPYOLOv2", "MaskRCNN",
-    "PicoDet"
+    "PicoDet", "PPYOLOEPLUS"
 ]
 
 
@@ -110,8 +108,7 @@ class BaseDetector(BaseModel):
                           scheduler='Piecewise',
                           num_epochs=None):
         if scheduler.lower() == 'piecewise':
-            if warmup_steps > 0 and warmup_steps > lr_decay_epochs[
-                0] * num_steps_each_epoch:
+            if warmup_steps > 0 and warmup_steps > lr_decay_epochs[0] * num_steps_each_epoch:
                 logging.error(
                     "In function train(), parameters must satisfy: "
                     "warmup_steps <= lr_decay_epochs[0] * num_samples_in_train_dataset. "
@@ -896,6 +893,270 @@ class PicoDet(BaseDetector):
             resume_checkpoint=resume_checkpoint)
 
 
+class PPYOLOEPLUS(BaseDetector):
+    def __init__(self,
+                 num_classes=80,
+                 backbone='CSPResNet_s',
+                 nms_score_threshold=.01,
+                 nms_topk=1000,
+                 nms_keep_topk=300,
+                 nms_iou_threshold=.7,
+                 **params):
+        self.init_params = locals()
+        if backbone not in {
+            'CSPResNet_s', 'CSPResNet_m', 'CSPResNet_l', 'CSPResNet_x'
+        }:
+            raise ValueError(
+                "backbone: {} is not supported. Please choose one of "
+                "('CSPResNet_s', 'CSPResNet_m', 'CSPResNet_l', 'CSPResNet_x')".
+                format(backbone))
+        self.backbone_name = backbone
+        if params.get('with_net', True):
+            if backbone == 'CSPResNet_s':
+                backbone = self._get_backbone(
+                    'CSPResNet',
+                    layers=[3, 6, 6, 3],
+                    channels=[64, 128, 256, 512, 1024],
+                    return_idx=[1, 2, 3],
+                    use_large_stem=True,
+                    use_alpha=True,
+                    depth_mult=0.33,
+                    width_mult=0.50
+                )
+            elif backbone == 'CSPResNet_m':
+                backbone = self._get_backbone(
+                    'CSPResNet',
+                    layers=[3, 6, 6, 3],
+                    channels=[64, 128, 256, 512, 1024],
+                    return_idx=[1, 2, 3],
+                    use_large_stem=True,
+                    use_alpha=True,
+                    depth_mult=0.67,
+                    width_mult=0.75
+                )
+            elif backbone == 'CSPResNet_l':
+                backbone = self._get_backbone(
+                    'CSPResNet',
+                    layers=[3, 6, 6, 3],
+                    channels=[64, 128, 256, 512, 1024],
+                    return_idx=[1, 2, 3],
+                    use_large_stem=True,
+                    use_alpha=True,
+                    depth_mult=1.0,
+                    width_mult=1.0
+                )
+            elif backbone == 'CSPResNet_x':
+                backbone = self._get_backbone(
+                    'CSPResNet',
+                    layers=[3, 6, 6, 3],
+                    channels=[64, 128, 256, 512, 1024],
+                    return_idx=[1, 2, 3],
+                    use_large_stem=True,
+                    use_alpha=True,
+                    depth_mult=1.33,
+                    width_mult=1.25
+                )
+            else:
+                backbone = self._get_backbone(
+                    'ResNet',
+                    depth=18,
+                    variant='d',
+                    return_idx=[1, 2, 3],
+                    freeze_at=-1,
+                    freeze_norm=False,
+                    norm_decay=0.)
+
+            neck = ppdet.modeling.CustomCSPPAN(
+                in_channels=[i.channels for i in backbone.out_shape],
+                out_channels=[768, 384, 192],
+                stage_num=1,
+                block_num=3,
+                act='swish',
+                spp=True
+            )
+            static_assigner = ppdet.modeling.ATSSAssigner(topk=9)
+            assigner = ppdet.modeling.TaskAlignedAssigner(topk=13, alpha=1.0, beta=6.0)
+            nms = ppdet.modeling.MultiClassNMS(
+                nms_top_k=nms_topk,
+                keep_top_k=nms_keep_topk,
+                score_threshold=nms_score_threshold,
+                nms_threshold=nms_iou_threshold)
+            head = ppdet.modeling.PPYOLOEHead(
+                in_channels=[768, 384, 192],
+                num_classes=num_classes,
+                fpn_strides=[32, 16, 8],
+                grid_cell_scale=5.0,
+                grid_cell_offset=0.5,
+                static_assigner_epoch=30,
+                use_varifocal_loss=True,
+                loss_weight={'class': 1.0, 'iou': 2.5, 'dfl': 0.5},
+                static_assigner=static_assigner,
+                assigner=assigner,
+                nms=nms)
+            params.update({
+                'backbone': backbone,
+                'neck': neck,
+                'yolo_head': head,
+            })
+        super(PPYOLOEPLUS, self).__init__(
+            model_name='PPYOLOE',
+            num_classes=num_classes,
+            **params)
+
+    def _compose_batch_transform(self, transforms, mode='train'):
+        default_batch_transforms = [_BatchPadding(pad_to_stride=32)]
+        if mode == 'eval':
+            collate_batch = True
+        else:
+            collate_batch = False
+
+        custom_batch_transforms = []
+        for i, op in enumerate(transforms.transforms):
+            if isinstance(op, (BatchRandomResize, BatchRandomResizeByShort, PadGT, PadRGT)):
+                if mode != 'train':
+                    raise Exception(
+                        "{} cannot be present in the {} transforms. ".format(
+                            op.__class__.__name__, mode) +
+                        "Please check the {} transforms.".format(mode))
+                custom_batch_transforms.insert(0, copy.deepcopy(op))
+
+        batch_transforms = BatchCompose(
+            custom_batch_transforms + default_batch_transforms,
+            collate_batch=collate_batch)
+
+        return batch_transforms
+
+    def _fix_transforms_shape(self, image_shape):
+        if getattr(self, 'test_transforms', None):
+            has_resize_op = False
+            resize_op_idx = -1
+            normalize_op_idx = len(self.test_transforms.transforms)
+            for idx, op in enumerate(self.test_transforms.transforms):
+                name = op.__class__.__name__
+                if name == 'Resize':
+                    has_resize_op = True
+                    resize_op_idx = idx
+                if name == 'Normalize':
+                    normalize_op_idx = idx
+
+            if not has_resize_op:
+                self.test_transforms.transforms.insert(
+                    normalize_op_idx,
+                    Resize(
+                        target_size=image_shape, interp='CUBIC'))
+            else:
+                self.test_transforms.transforms[
+                    resize_op_idx].target_size = image_shape
+
+    def _get_test_inputs(self, image_shape):
+        if image_shape is not None:
+            image_shape = self._check_image_shape(image_shape)
+            self._fix_transforms_shape(image_shape[-2:])
+        else:
+            image_shape = [None, 3, 320, 320]
+            if getattr(self, 'test_transforms', None):
+                for idx, op in enumerate(self.test_transforms.transforms):
+                    name = op.__class__.__name__
+                    if name == 'Resize':
+                        image_shape = [None, 3] + list(
+                            self.test_transforms.transforms[idx].target_size)
+            logging.warning(
+                '[Important!!!] When exporting inference model for {}, '
+                'if fixed_input_shape is not set, it will be forcibly set to {}. '
+                'Please ensure image shape after transforms is {}, if not, '
+                'fixed_input_shape should be specified manually.'
+                .format(self.__class__.__name__, image_shape, image_shape[1:]))
+
+        self.fixed_input_shape = image_shape
+        return self._define_input_spec(image_shape)
+
+    def train(self,
+              num_epochs,
+              train_dataset,
+              train_batch_size=64,
+              eval_dataset=None,
+              optimizer=None,
+              save_interval_epochs=1,
+              log_interval_steps=10,
+              save_dir='output',
+              pretrain_weights='IMAGENET',
+              learning_rate=.001,
+              warmup_steps=0,
+              warmup_start_lr=0.0,
+              lr_decay_epochs=(216, 243),
+              lr_decay_gamma=0.1,
+              metric=None,
+              use_ema=False,
+              early_stop=False,
+              early_stop_patience=5,
+              use_vdl=True,
+              resume_checkpoint=None):
+        """
+        Train the model.
+        Args:
+            num_epochs(int): The number of epochs.
+            train_dataset(paddlex.dataset): Training dataset.
+            train_batch_size(int, optional): Total batch size among all cards used in training. Defaults to 64.
+            eval_dataset(paddlex.dataset, optional):
+                Evaluation dataset. If None, the model will not be evaluated during training process. Defaults to None.
+            optimizer(paddle.optimizer.Optimizer or None, optional):
+                Optimizer used for training. If None, a default optimizer is used. Defaults to None.
+            save_interval_epochs(int, optional): Epoch interval for saving the model. Defaults to 1.
+            log_interval_steps(int, optional): Step interval for printing training information. Defaults to 10.
+            save_dir(str, optional): Directory to save the model. Defaults to 'output'.
+            pretrain_weights(str or None, optional):
+                None or name/path of pretrained weights. If None, no pretrained weights will be loaded. Defaults to 'IMAGENET'.
+            learning_rate(float, optional): Learning rate for training. Defaults to .001.
+            warmup_steps(int, optional): The number of steps of warm-up training. Defaults to 0.
+            warmup_start_lr(float, optional): Start learning rate of warm-up training. Defaults to 0..
+            lr_decay_epochs(list or tuple, optional): Epoch milestones for learning rate decay. Defaults to (216, 243).
+            lr_decay_gamma(float, optional): Gamma coefficient of learning rate decay. Defaults to .1.
+            metric({'VOC', 'COCO', None}, optional):
+                Evaluation metric. If None, determine the metric according to the dataset format. Defaults to None.
+            use_ema(bool, optional): Whether to use exponential moving average strategy. Defaults to False.
+            early_stop(bool, optional): Whether to adopt early stop strategy. Defaults to False.
+            early_stop_patience(int, optional): Early stop patience. Defaults to 5.
+            use_vdl(bool, optional): Whether to use VisualDL to monitor the training process. Defaults to True.
+            resume_checkpoint(str or None, optional): The path of the checkpoint to resume training from.
+                If None, no training checkpoint will be resumed. At most one of `resume_checkpoint` and
+                `pretrain_weights` can be set simultaneously. Defaults to None.
+        """
+        if optimizer is None:
+            num_steps_each_epoch = len(train_dataset) // train_batch_size
+            optimizer = self.default_optimizer(
+                parameters=self.net.parameters(),
+                learning_rate=learning_rate,
+                warmup_steps=warmup_steps,
+                warmup_start_lr=warmup_start_lr,
+                lr_decay_epochs=lr_decay_epochs,
+                lr_decay_gamma=lr_decay_gamma,
+                num_steps_each_epoch=num_steps_each_epoch,
+                reg_coeff=4e-05,
+                scheduler='Cosine',
+                num_epochs=num_epochs)
+        super(PPYOLOEPLUS, self).train(
+            num_epochs=num_epochs,
+            train_dataset=train_dataset,
+            train_batch_size=train_batch_size,
+            eval_dataset=eval_dataset,
+            optimizer=optimizer,
+            save_interval_epochs=save_interval_epochs,
+            log_interval_steps=log_interval_steps,
+            save_dir=save_dir,
+            pretrain_weights=pretrain_weights,
+            learning_rate=learning_rate,
+            warmup_steps=warmup_steps,
+            warmup_start_lr=warmup_start_lr,
+            lr_decay_epochs=lr_decay_epochs,
+            lr_decay_gamma=lr_decay_gamma,
+            metric=metric,
+            use_ema=use_ema,
+            early_stop=early_stop,
+            early_stop_patience=early_stop_patience,
+            use_vdl=use_vdl,
+            resume_checkpoint=resume_checkpoint)
+
+
 class YOLOv3(BaseDetector):
     def __init__(self,
                  num_classes=80,
@@ -922,8 +1183,8 @@ class YOLOv3(BaseDetector):
 
         self.backbone_name = backbone
         if params.get('with_net', True):
-            if traintoolx.env_info['place'] == 'gpu' and traintoolx.env_info[
-                'num'] > 1 and not os.environ.get('PADDLEX_EXPORT_STAGE'):
+            if traintoolx.env_info['place'] == 'gpu' and traintoolx.env_info['num'] > 1 and not os.environ.get(
+                    'PADDLEX_EXPORT_STAGE'):
                 norm_type = 'sync_bn'
             else:
                 norm_type = 'bn'
@@ -1445,8 +1706,8 @@ class PPYOLO(YOLOv3):
         ] if backbone == 'ResNet50_vd_dcn' else [32, 16]
 
         if params.get('with_net', True):
-            if traintoolx.env_info['place'] == 'gpu' and traintoolx.env_info[
-                'num'] > 1 and not os.environ.get('PADDLEX_EXPORT_STAGE'):
+            if traintoolx.env_info['place'] == 'gpu' and traintoolx.env_info['num'] > 1 and not os.environ.get(
+                    'PADDLEX_EXPORT_STAGE'):
                 norm_type = 'sync_bn'
             else:
                 norm_type = 'bn'
@@ -1627,8 +1888,8 @@ class PPYOLOTiny(YOLOv3):
         self.backbone_name = 'MobileNetV3'
         self.downsample_ratios = [32, 16, 8]
         if params.get('with_net', True):
-            if traintoolx.env_info['place'] == 'gpu' and traintoolx.env_info[
-                'num'] > 1 and not os.environ.get('PADDLEX_EXPORT_STAGE'):
+            if traintoolx.env_info['place'] == 'gpu' and traintoolx.env_info['num'] > 1 and not os.environ.get(
+                    'PADDLEX_EXPORT_STAGE'):
                 norm_type = 'sync_bn'
             else:
                 norm_type = 'bn'

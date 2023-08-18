@@ -1,11 +1,8 @@
 import traceback
 import random
 import numpy as np
-
-try:
-    from collections.abc import Sequence
-except Exception:
-    from collections import Sequence
+import cv2
+from typing import Sequence
 
 from .operators import Transform, Resize, ResizeByShort, _Permute, interp_dict
 from .box_utils import jaccard_overlap
@@ -270,5 +267,223 @@ class _Gt2YoloTarget(Transform):
             # remove useless gt_class and gt_score after target calculated
             sample.pop('gt_class')
             sample.pop('gt_score')
+
+        return samples
+
+
+class PadGT(Transform):
+    """
+    Pad 0 to `gt_class`, `gt_bbox`, `gt_score`...
+    The num_max_boxes is the largest for batch.
+    Args:
+        return_gt_mask (bool): If true, return `pad_gt_mask`,
+                                1 means bbox, 0 means no bbox.
+    """
+
+    def __init__(self, return_gt_mask=True, pad_img=False, minimum_gtnum=0):
+        super(PadGT, self).__init__()
+        self.return_gt_mask = return_gt_mask
+        self.pad_img = pad_img
+        self.minimum_gtnum = minimum_gtnum
+
+    def _impad(self, img: np.ndarray,
+               *,
+               shape=None,
+               padding=None,
+               pad_val=0,
+               padding_mode='constant') -> np.ndarray:
+        """Pad the given image to a certain shape or pad on all sides with
+        specified padding mode and padding value.
+
+        Args:
+            img (ndarray): Image to be padded.
+            shape (tuple[int]): Expected padding shape (h, w). Default: None.
+            padding (int or tuple[int]): Padding on each border. If a single int is
+                provided this is used to pad all borders. If tuple of length 2 is
+                provided this is the padding on left/right and top/bottom
+                respectively. If a tuple of length 4 is provided this is the
+                padding for the left, top, right and bottom borders respectively.
+                Default: None. Note that `shape` and `padding` can not be both
+                set.
+            pad_val (Number | Sequence[Number]): Values to be filled in padding
+                areas when padding_mode is 'constant'. Default: 0.
+            padding_mode (str): Type of padding. Should be: constant, edge,
+                reflect or symmetric. Default: constant.
+                - constant: pads with a constant value, this value is specified
+                with pad_val.
+                - edge: pads with the last value at the edge of the image.
+                - reflect: pads with reflection of image without repeating the last
+                value on the edge. For example, padding [1, 2, 3, 4] with 2
+                elements on both sides in reflect mode will result in
+                [3, 2, 1, 2, 3, 4, 3, 2].
+                - symmetric: pads with reflection of image repeating the last value
+                on the edge. For example, padding [1, 2, 3, 4] with 2 elements on
+                both sides in symmetric mode will result in
+                [2, 1, 1, 2, 3, 4, 4, 3]
+
+        Returns:
+            ndarray: The padded image.
+        """
+
+        assert (shape is not None) ^ (padding is not None)
+        if shape is not None:
+            width = max(shape[1] - img.shape[1], 0)
+            height = max(shape[0] - img.shape[0], 0)
+            padding = (0, 0, int(width), int(height))
+
+        # check pad_val
+        import numbers
+        if isinstance(pad_val, tuple):
+            assert len(pad_val) == img.shape[-1]
+        elif not isinstance(pad_val, numbers.Number):
+            raise TypeError('pad_val must be a int or a tuple. '
+                            f'But received {type(pad_val)}')
+
+        # check padding
+        if isinstance(padding, tuple) and len(padding) in [2, 4]:
+            if len(padding) == 2:
+                padding = (padding[0], padding[1], padding[0], padding[1])
+        elif isinstance(padding, numbers.Number):
+            padding = (padding, padding, padding, padding)
+        else:
+            raise ValueError('Padding must be a int or a 2, or 4 element tuple.'
+                             f'But received {padding}')
+
+        # check padding mode
+        assert padding_mode in ['constant', 'edge', 'reflect', 'symmetric']
+
+        border_type = {
+            'constant': cv2.BORDER_CONSTANT,
+            'edge': cv2.BORDER_REPLICATE,
+            'reflect': cv2.BORDER_REFLECT_101,
+            'symmetric': cv2.BORDER_REFLECT
+        }
+        img = cv2.copyMakeBorder(
+            img,
+            padding[1],
+            padding[3],
+            padding[0],
+            padding[2],
+            border_type[padding_mode],
+            value=pad_val)
+
+        return img
+
+    def checkmaxshape(self, samples):
+        maxh, maxw = 0, 0
+        for sample in samples:
+            h, w = sample['im_shape']
+            if h > maxh:
+                maxh = h
+            if w > maxw:
+                maxw = w
+        return (maxh, maxw)
+
+    def __call__(self, samples, context=None):
+        num_max_boxes = max([len(s['gt_bbox']) for s in samples])
+        num_max_boxes = max(self.minimum_gtnum, num_max_boxes)
+        if self.pad_img:
+            maxshape = self.checkmaxshape(samples)
+        for sample in samples:
+            if self.pad_img:
+                img = sample['image']
+                padimg = self._impad(img, shape=maxshape)
+                sample['image'] = padimg
+            if self.return_gt_mask:
+                sample['pad_gt_mask'] = np.zeros(
+                    (num_max_boxes, 1), dtype=np.float32)
+            if num_max_boxes == 0:
+                continue
+
+            num_gt = len(sample['gt_bbox'])
+            pad_gt_class = np.zeros((num_max_boxes, 1), dtype=np.int32)
+            pad_gt_bbox = np.zeros((num_max_boxes, 4), dtype=np.float32)
+            if num_gt > 0:
+                pad_gt_class[:num_gt] = sample['gt_class']
+                pad_gt_bbox[:num_gt] = sample['gt_bbox']
+            sample['gt_class'] = pad_gt_class
+            sample['gt_bbox'] = pad_gt_bbox
+            # pad_gt_mask
+            if 'pad_gt_mask' in sample:
+                sample['pad_gt_mask'][:num_gt] = 1
+            # gt_score
+            if 'gt_score' in sample:
+                pad_gt_score = np.zeros((num_max_boxes, 1), dtype=np.float32)
+                if num_gt > 0:
+                    pad_gt_score[:num_gt] = sample['gt_score']
+                sample['gt_score'] = pad_gt_score
+            if 'is_crowd' in sample:
+                pad_is_crowd = np.zeros((num_max_boxes, 1), dtype=np.int32)
+                if num_gt > 0:
+                    pad_is_crowd[:num_gt] = sample['is_crowd']
+                sample['is_crowd'] = pad_is_crowd
+            if 'difficult' in sample:
+                pad_diff = np.zeros((num_max_boxes, 1), dtype=np.int32)
+                if num_gt > 0:
+                    pad_diff[:num_gt] = sample['difficult']
+                sample['difficult'] = pad_diff
+            if 'gt_joints' in sample:
+                num_joints = sample['gt_joints'].shape[1]
+                pad_gt_joints = np.zeros((num_max_boxes, num_joints, 3), dtype=np.float32)
+                if num_gt > 0:
+                    pad_gt_joints[:num_gt] = sample['gt_joints']
+                sample['gt_joints'] = pad_gt_joints
+            if 'gt_areas' in sample:
+                pad_gt_areas = np.zeros((num_max_boxes, 1), dtype=np.float32)
+                if num_gt > 0:
+                    pad_gt_areas[:num_gt, 0] = sample['gt_areas']
+                sample['gt_areas'] = pad_gt_areas
+        return samples
+
+
+class PadRGT(Transform):
+    """
+    Pad 0 to `gt_class`, `gt_bbox`, `gt_score`...
+    The num_max_boxes is the largest for batch.
+    Args:
+        return_gt_mask (bool): If true, return `pad_gt_mask`,
+                                1 means bbox, 0 means no bbox.
+    """
+
+    def __init__(self, return_gt_mask=True):
+        super(PadRGT, self).__init__()
+        self.return_gt_mask = return_gt_mask
+
+    def pad_field(self, sample, field, num_gt):
+        name, shape, dtype = field
+        if name in sample:
+            pad_v = np.zeros(shape, dtype=dtype)
+            if num_gt > 0:
+                pad_v[:num_gt] = sample[name]
+            sample[name] = pad_v
+
+    def __call__(self, samples, context=None):
+        num_max_boxes = max([len(s['gt_bbox']) for s in samples])
+        for sample in samples:
+            if self.return_gt_mask:
+                sample['pad_gt_mask'] = np.zeros(
+                    (num_max_boxes, 1), dtype=np.float32)
+            if num_max_boxes == 0:
+                continue
+
+            num_gt = len(sample['gt_bbox'])
+            pad_gt_class = np.zeros((num_max_boxes, 1), dtype=np.int32)
+            pad_gt_bbox = np.zeros((num_max_boxes, 4), dtype=np.float32)
+            if num_gt > 0:
+                pad_gt_class[:num_gt] = sample['gt_class']
+                pad_gt_bbox[:num_gt] = sample['gt_bbox']
+            sample['gt_class'] = pad_gt_class
+            sample['gt_bbox'] = pad_gt_bbox
+            # pad_gt_mask
+            if 'pad_gt_mask' in sample:
+                sample['pad_gt_mask'][:num_gt] = 1
+            # gt_score
+            names = ['gt_score', 'is_crowd', 'difficult', 'gt_poly', 'gt_rbox']
+            dims = [1, 1, 1, 8, 5]
+            dtypes = [np.float32, np.int32, np.int32, np.float32, np.float32]
+
+            for name, dim, dtype in zip(names, dims, dtypes):
+                self.pad_field(sample, [name, (num_max_boxes, dim), dtype],
+                               num_gt)
 
         return samples

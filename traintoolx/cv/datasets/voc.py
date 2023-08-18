@@ -245,10 +245,8 @@ class VOCDetection(Dataset):
                 if gt_bbox.size > 0:
                     self.file_list.append({
                         'image': img_file,
-                        **
-                        im_info,
-                        **
-                        label_info
+                        **im_info,
+                        **label_info
                     })
                     annotations['images'].append({
                         'height': im_h,
@@ -259,10 +257,8 @@ class VOCDetection(Dataset):
                 else:
                     neg_file_list.append({
                         'image': img_file,
-                        **
-                        im_info,
-                        **
-                        label_info
+                        **im_info,
+                        **label_info
                     })
                 ct += 1
 

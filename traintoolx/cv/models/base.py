@@ -318,10 +318,12 @@ class BaseModel:
             step_time_tic = time.time()
 
             for step, data in enumerate(self.train_data_loader()):
+                data['epoch_id'] = i
                 if nranks > 1:
                     outputs = self.run(ddp_net, data, mode='train')
                 else:
                     outputs = self.run(self.net, data, mode='train')
+
                 loss = outputs['loss']
                 loss.backward()
                 self.optimizer.step()

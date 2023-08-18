@@ -7,7 +7,6 @@ import traintoolx
 
 from typing import Sequence
 
-
 from numbers import Number
 from .functions import normalize, horizontal_flip, permute, vertical_flip, center_crop, is_poly, \
     horizontal_flip_poly, horizontal_flip_rle, vertical_flip_poly, vertical_flip_rle, crop_poly, \
@@ -107,6 +106,8 @@ class Compose(Transform):
             # skip batch transforms amd mixup
             if isinstance(op, (traintoolx.transforms.BatchRandomResize,
                                traintoolx.transforms.BatchRandomResizeByShort,
+                               traintoolx.transforms.PadGT,
+                               traintoolx.transforms.PadRGT,
                                MixupImage)):
                 continue
             sample = op(sample)
